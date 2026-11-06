@@ -11,7 +11,7 @@ const net = require("net");
 const { exec, execSync } = require("child_process");
 
 // ========================================================
-// DIREKTORI PENYIMPANAN PERMANEN (./data) & PORT KUSTOM
+// DIREKTORI PENYIMPANAN PERMANEN (./data) & PORT DINAMIS NAT
 // ========================================================
 const DATA_DIR = path.join(__dirname, "data");
 if (!fs.existsSync(DATA_DIR)) {
@@ -24,12 +24,14 @@ if (!fs.existsSync(FILE_PATH)) {
 }
 
 const SUB_PATH = process.env.SUB_PATH || "sub";
-const PORT = parseInt(process.env.UI_PORT || process.env.PORT || "20681", 10);
-const MUX_PORT = parseInt(process.env.MUX_PORT || "20682", 10);
-const ARGO_PORT = parseInt(process.env.ARGO_PORT || "8001", 10);
+const PORT = parseInt(process.env.UI_PORT || process.env.PORT || "21071", 10);
+const MUX_PORT = parseInt(process.env.MUX_PORT || "21072", 10);
+const DEFAULT_UDPGW_PORT = String(process.env.UDPGW_PORT || "21073");
 const DEFAULT_SSH_PORT = parseInt(process.env.DROPBEAR_PORT || "2222", 10);
+const WS_SSH_PROXY_PORT = parseInt(process.env.WS_PORT || "8880", 10);
+const ARGO_PORT = parseInt(process.env.ARGO_PORT || "8001", 10);
 const CFPORT = process.env.CFPORT || 443;
-const NAME = process.env.NAME || "VPS-NODE";
+const NAME = process.env.NAME || "NAT-VPS";
 
 const LOG_PATH = path.join(DATA_DIR, "boot.log");
 const ZT_LOG_PATH = path.join(DATA_DIR, "named_tunnel.log");
@@ -44,7 +46,6 @@ const STATS_PATH = path.join(DATA_DIR, "server_stats.json");
 const DB_PATH = path.join(DATA_DIR, "ssh_details.json");
 const V2RAY_DB_PATH = path.join(DATA_DIR, "v2ray_users.json");
 
-// Dummy UUID acak internal hanya dipakai saat tabel V2Ray kosong agar Xray tidak gagal booting
 const INTERNAL_DUMMY_UUID = crypto.randomUUID();
 
 let cachedDiskUsage = "0%";
@@ -96,7 +97,7 @@ function getSystemSettings() {
             return JSON.parse(fs.readFileSync(SYSTEM_CONFIG_FILE, "utf8"));
         }
     } catch (e) {}
-    return { banner: "", enable_bbr: "true", udpgw_port: "7300", udpgw_max_clients: "1000" };
+    return { banner: "", enable_bbr: "true", udpgw_port: DEFAULT_UDPGW_PORT, udpgw_max_clients: "1000" };
 }
 
 function saveSystemSettings(banner, enable_bbr, udpgw_port, udpgw_max_clients) {
@@ -104,7 +105,7 @@ function saveSystemSettings(banner, enable_bbr, udpgw_port, udpgw_max_clients) {
         const data = {
             banner: banner || "",
             enable_bbr: enable_bbr || "true",
-            udpgw_port: udpgw_port || "7300",
+            udpgw_port: udpgw_port || DEFAULT_UDPGW_PORT,
             udpgw_max_clients: udpgw_max_clients || "1000"
         };
         fs.writeFileSync(SYSTEM_CONFIG_FILE, JSON.stringify(data, null, 2));
@@ -268,9 +269,9 @@ function getDomainsByPort(targetPorts) {
 function getCurrentHosts() {
     const ztDomains = getDomainsByPort(["8880", "8881", String(MUX_PORT)]);
     const namedUrl = ztDomains.length > 0 ? ztDomains[0].domain : "";
-    const hostAddr = detectedPublicIp || "IP-VPS";
+    const hostAddr = detectedPublicIp || "IP-NAT-VPS";
 
-    let hostOutput = hostAddr + ":" + MUX_PORT + " (Direct WS/SSL)";
+    let hostOutput = hostAddr + ":" + MUX_PORT + " (Direct NAT)";
     if (namedUrl && !namedUrl.includes("Menghubungkan")) {
         hostOutput += " | " + namedUrl.replace(/https?:\/\//, "") + " (Argo WS)";
     }
@@ -331,13 +332,17 @@ function addSsh(username, password, expDays, ipAddr, userAgent) {
         saveDb(dbInfo);
 
         const activeHost = getCurrentHosts();
+        const sysCfg = getSystemSettings();
+        const activeUdpgw = sysCfg.udpgw_port || DEFAULT_UDPGW_PORT;
+
         const accountDetails =
             "================================\n" +
             "       SSH ACCOUNT CREATED      \n" +
             "================================\n" +
             "Host SSH  : " + activeHost + "\n" +
-            "Port Mux  : " + MUX_PORT + " (WS & SSL)\n" +
+            "Port NAT  : " + MUX_PORT + " (WS Payload & SSL)\n" +
             "Port CF   : 443 (TLS) / 80 (NTLS)\n" +
+            "Port UDP  : " + activeUdpgw + " (BadVPN UDPGW)\n" +
             "Username  : " + username + "\n" +
             "Password  : " + password + "\n" +
             "Expired   : " + expDateStr + " (" + days + " Hari)\n" +
@@ -423,7 +428,8 @@ async function addV2ray(username, customUuid, expDays) {
         "Username  : " + username + "\n" +
         "UUID/Pass : " + newUuid + "\n" +
         "Protokol  : VLESS / VMess / Trojan\n" +
-        "Port VPS  : " + PORT + " (Direct WS)\n" +
+        "Port NAT  : " + PORT + " (Direct WS)\n" +
+        "Port CF   : 443 (TLS) / 80 (NTLS)\n" +
         "Expired   : " + expDateStr + " (" + days + " Hari)\n" +
         "================================\n" +
         "Klik tombol [PAKAI UUID] pada tabel di bawah\n" +
@@ -507,7 +513,7 @@ function readPathsFromFile(filename, defaultPath) {
 function getAllActiveXrayUuids() {
     const v2rayDb = loadV2rayDb();
     const now = Date.now();
-    const uuidSet = new Set(); // Master UUID sudah tidak disertakan
+    const uuidSet = new Set();
 
     const keys = Object.keys(v2rayDb);
     for (let i = 0; i < keys.length; i++) {
@@ -517,7 +523,6 @@ function getAllActiveXrayUuids() {
         }
     }
 
-    // Jika belum ada akun V2Ray yang dibuat sama sekali, gunakan dummy UUID rahasia agar Xray tetap hidup
     if (uuidSet.size === 0) {
         uuidSet.add(INTERNAL_DUMMY_UUID);
     }
@@ -636,7 +641,6 @@ function getSystemArchitecture() {
 
 function downloadFile(fileName, fileUrl, callback) {
     if (!fs.existsSync(FILE_PATH)) fs.mkdirSync(FILE_PATH, { recursive: true });
-    // Jika binary sudah ada di ./data/core, tidak perlu unduh ulang setiap restart
     if (fs.existsSync(fileName) && fs.statSync(fileName).size > 1000000) {
         return callback(null, fileName);
     }
@@ -704,7 +708,7 @@ async function getMetaInfo() {
         }
         return (res.data.country_code + "-" + res.data.isp).replace(/\s+/g, "_");
     } catch (e) {
-        return "VPSServer";
+        return "NATServer";
     }
 }
 
@@ -773,7 +777,7 @@ const server = http.createServer(async function(req, res) {
         const defaultVmess = readPathsFromFile("pathvmess.txt", "/vmess-argo")[0];
         const defaultTrojan = readPathsFromFile("pathtrojan.txt", "/trojan-argo")[0];
         return res.end(JSON.stringify({
-            uuid: "", // Master UUID dinonaktifkan, wajib pilih akun dari tabel V2Ray
+            uuid: "",
             cfip: getActiveCfip(),
             domain: currentActiveDomain || "Menunggu Quick Tunnel...",
             paths: { vless: defaultVless, vmess: defaultVmess, trojan: defaultTrojan }
@@ -854,7 +858,7 @@ const server = http.createServer(async function(req, res) {
 
         const banner = query.banner ? decodeURIComponent(query.banner) : "";
         const enable_bbr = query.enable_bbr || "true";
-        const udpgw_port = query.udpgw_port || "7300";
+        const udpgw_port = query.udpgw_port || DEFAULT_UDPGW_PORT;
         const udpgw_max_clients = query.udpgw_max_clients || "1000";
 
         saveSystemSettings(banner, enable_bbr, udpgw_port, udpgw_max_clients);
@@ -1012,10 +1016,8 @@ const server = http.createServer(async function(req, res) {
         let sysSettings = getSystemSettings();
 
         let hostAddr = detectedPublicIp || (req.headers.host ? req.headers.host.split(":")[0] : "");
-        let vpsV2rayEndpoint = process.env.RAILWAY_PUBLIC_DOMAIN || (hostAddr ? (hostAddr + ":" + PORT) : "Tidak Aktif");
-        let vpsSshEndpoint = (process.env.RAILWAY_TCP_PROXY_DOMAIN && process.env.RAILWAY_TCP_PROXY_PORT)
-            ? (process.env.RAILWAY_TCP_PROXY_DOMAIN + ":" + process.env.RAILWAY_TCP_PROXY_PORT)
-            : (hostAddr ? (hostAddr + ":" + MUX_PORT) : "Tidak Aktif");
+        let vpsV2rayEndpoint = hostAddr ? (hostAddr + ":" + PORT) : "Tidak Aktif";
+        let vpsSshEndpoint = hostAddr ? (hostAddr + ":" + MUX_PORT) : "Tidak Aktif";
 
         let cleanOnlineStr = String(hwInfo.ssh_online).replace(/Active/g, "").replace(/Users/g, "").trim();
 
@@ -1079,7 +1081,7 @@ const server = http.createServer(async function(req, res) {
 });
 
 // ========================================================
-// HANDLER WEBSOCKET DUAL-MODE (UI WEB & VPN XRAY FORWARDING)
+// HANDLER WEBSOCKET DUAL-MODE (SSH WS & XRAY V2RAY)
 // ========================================================
 function forwardWebsocket(targetPort, req, socket, head) {
     const targetConn = net.createConnection({ port: targetPort, host: "127.0.0.1" }, function() {
@@ -1106,22 +1108,30 @@ function forwardWebsocket(targetPort, req, socket, head) {
 }
 
 server.on("upgrade", function(req, socket, head) {
-    const urlPath = req.url.split("?")[0];
+    const rawUrl = req.url || "/";
+    const cleanPath = rawUrl.split("?")[0];
 
-    if (urlPath === "/ssh-ws" || urlPath.startsWith("/ssh")) {
-        const wsCfg = getWsProxyConfig();
-        const targetPort = wsCfg.sshPort || DEFAULT_SSH_PORT;
-        return forwardWebsocket(targetPort, req, socket, head);
+    const vlessPaths = readPathsFromFile("pathvless.txt", "/vless-argo");
+    const vmessPaths = readPathsFromFile("pathvmess.txt", "/vmess-argo");
+    const trojanPaths = readPathsFromFile("pathtrojan.txt", "/trojan-argo");
+    const allXrayPaths = [].concat(vlessPaths, vmessPaths, trojanPaths);
+
+    const isXrayPath = allXrayPaths.some(function(p) {
+        return cleanPath === p || cleanPath.endsWith(p);
+    });
+
+    if (isXrayPath) {
+        return forwardWebsocket(ARGO_PORT, req, socket, head);
     }
 
-    return forwardWebsocket(ARGO_PORT, req, socket, head);
+    return forwardWebsocket(WS_SSH_PROXY_PORT, req, socket, head);
 });
 
 // ========================================================
 // START LISTEN SERVER
 // ========================================================
-server.listen(PORT, function() {
-    console.log("[VPS Panel & Xray Gateway] Aktif di Port UI/V2Ray: " + PORT + " | Port SSH Mux: " + MUX_PORT);
+server.listen(PORT, "0.0.0.0", function() {
+    console.log("[NAT VPS Panel] UI & V2Ray Port: " + PORT + " | SSH Mux Port: " + MUX_PORT + " | UDPGW: " + DEFAULT_UDPGW_PORT);
     restoreSshUsersOnBoot();
     getMetaInfo();
 
