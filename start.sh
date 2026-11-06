@@ -1,35 +1,36 @@
 #!/bin/bash
 
 # =================================================================
-# ⚙️ KONFIGURASI PORT KUSTOM VPS / NAT VPS
+# ⚙️ BACA PORT DINAMIS DARI ./data/nat_ports.env
 # =================================================================
-# Ubah sesuai jatah port NAT VPS Anda (atau bebas jika VPS biasa)
-export UI_PORT="${UI_PORT:-20681}"       # Port Publik untuk Web Panel & V2Ray WS
-export MUX_PORT="${MUX_PORT:-20682}"     # Port Publik untuk SSH WS & SSH SSL (Stunnel)
-export VPS_PUBLIC_ADDR="${VPS_PUBLIC_ADDR:-}" # Opsional: Isi IP/Domain VPS (contoh: 31.58.103.3)
+mkdir -p ./data
+if [ -f "./data/nat_ports.env" ]; then
+    source ./data/nat_ports.env
+fi
 
-# Port Internal (Bekerja di 127.0.0.1, tidak perlu diubah kecuali bentrok)
-export DROPBEAR_PORT="2222"              # Diubah ke 2222 agar tidak bentrok dengan OpenSSH port 22 VPS
+export UI_PORT="${UI_PORT:-21071}"       # Port Publik untuk Web Panel & V2Ray WS
+export MUX_PORT="${MUX_PORT:-21072}"     # Port Publik untuk SSH WS & SSH SSL (Stunnel)
+export UDPGW_PORT="${UDPGW_PORT:-21073}" # Port Publik untuk BadVPN UDPGW
+export DROPBEAR_PORT="${DROPBEAR_PORT:-2222}"
+export VPS_PUBLIC_ADDR="${VPS_PUBLIC_ADDR:-}"
+
+# Port Internal (Bekerja di 127.0.0.1)
 export WS_PORT="8880"                    # Internal WS-Proxy SSH
 export SSL_TARGET_PORT="2443"            # Internal Stunnel4
 export ARGO_PORT="8001"                  # Internal Xray Core
 
-# Buka limit socket
 ulimit -n 65535 2>/dev/null
 ulimit -s unlimited 2>/dev/null
 
-# Pastikan direktori penyimpanan permanen ./data tersedia
-mkdir -p ./data
 SYS_CFG="./data/system_config.json"
 WS_CFG="./data/ws_proxy_config.json"
 
-# Pastikan konfigurasi awal ws-proxy mengarah ke port Dropbear internal (2222)
 if [ ! -f "$WS_CFG" ]; then
     echo "{\"sshPort\": $DROPBEAR_PORT, \"keepAlive\": 15000, \"maxBuffer\": 32768}" > "$WS_CFG"
 fi
 
 # =================================================================
-# 🧹 PEMBERSIHAN PROSES LAMA (AMAN UNTUK VPS)
+# 🧹 PEMBERSIHAN PROSES LAMA
 # =================================================================
 echo "[*] Membersihkan proses panel lama & port yang tersangkut..."
 pkill -9 -f "node server.js" 2>/dev/null
@@ -51,26 +52,27 @@ sleep 1
 if [ -f "$SYS_CFG" ] && command -v jq >/dev/null 2>&1; then
     CUSTOM_BANNER=$(jq -r '.banner // empty' "$SYS_CFG")
     ENABLE_BBR=$(jq -r '.enable_bbr // "true"' "$SYS_CFG")
-    UDPGW_PORT=$(jq -r '.udpgw_port // "7300"' "$SYS_CFG")
+    CFG_UDPGW_PORT=$(jq -r '.udpgw_port // empty' "$SYS_CFG")
     UDPGW_MAX_CLIENTS=$(jq -r '.udpgw_max_clients // "1000"' "$SYS_CFG")
+    if [ -n "$CFG_UDPGW_PORT" ]; then
+        export UDPGW_PORT="$CFG_UDPGW_PORT"
+    fi
 else
     CUSTOM_BANNER=""
     ENABLE_BBR="true"
-    UDPGW_PORT="7300"
     UDPGW_MAX_CLIENTS="1000"
 fi
 
 if [ -f "$WS_CFG" ] && command -v jq >/dev/null 2>&1; then
     SAVED_SSH_PORT=$(jq -r '.sshPort // empty' "$WS_CFG")
     if [ -n "$SAVED_SSH_PORT" ] && [ "$SAVED_SSH_PORT" != "22" ]; then
-        DROPBEAR_PORT="$SAVED_SSH_PORT"
+        export DROPBEAR_PORT="$SAVED_SSH_PORT"
     fi
 fi
 
 # =================================================================
-# 🚀 ULTRA TURBO KERNEL TWEAKS & BBR SWITCH
+# 🚀 KERNEL TWEAKS & BBR SWITCH
 # =================================================================
-echo "[*] Mengoptimalkan jaringan kernel & TCP BBR..."
 sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null
 sysctl -w net.ipv4.tcp_fin_timeout=10 2>/dev/null
 sysctl -w net.core.default_qdisc=fq 2>/dev/null
@@ -91,14 +93,13 @@ sysctl -w net.ipv4.tcp_max_syn_backlog=8192 2>/dev/null
 # =================================================================
 # 🎨 PEMBUATAN BANNER DROPBEAR
 # =================================================================
-echo "[*] Membuat Banner Dropbear..."
 if [ -n "$CUSTOM_BANNER" ]; then
     echo -e "$CUSTOM_BANNER" > /etc/dropbear_banner
 else
     cat << 'EOF' > /etc/dropbear_banner
 ==================================================
           👑 SELAMAT MENIKMATI 👑
-         🥳 SSH & XRAY SERVER VPS 🥳
+       🥳 SSH & XRAY SERVER NAT VPS 🥳
 ==================================================
  🔹 MULTIPLEXER : NODE.JS JAVASCRIPT ENGINE
  🔹 OS PLATFORM : UBUNTU / DEBIAN
@@ -110,13 +111,12 @@ EOF
 fi
 
 # =================================================================
-# 🔒 KONFIGURASI DROPBEAR, STUNNEL, WS-PROXY & UDPGW
+# 🔒 KONFIGURASI DROPBEAR, STUNNEL4, WS-PROXY & UDPGW
 # =================================================================
-echo "[*] Membuat Sertifikat SSL Stunnel..."
 mkdir -p /etc/stunnel /var/run/stunnel4
 if [ ! -f /etc/stunnel/stunnel.pem ]; then
     openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
-        -subj "/C=ID/ST=Jakarta/L=Jakarta/O=VPSSSH/CN=localhost" \
+        -subj "/C=ID/ST=Jakarta/L=Jakarta/O=NATSSH/CN=localhost" \
         -keyout /etc/stunnel/stunnel.pem -out /etc/stunnel/stunnel.pem 2>/dev/null
     chmod 600 /etc/stunnel/stunnel.pem
 fi
@@ -149,7 +149,6 @@ if [ -f /usr/local/bin/badvpn-udpgw ]; then
 fi
 
 if [ -n "$TOKEN" ]; then
-    echo "[*] Menghubungkan Terowongan Zero Trust dari Environment Variable..."
     echo "$TOKEN" > ./data/zt_single_token.txt
     /usr/local/bin/cloudflared tunnel run --protocol http2 --no-tls-verify --token "$TOKEN" > ./data/named_tunnel.log 2>&1 &
 fi
@@ -162,4 +161,4 @@ nohup node mux.js >/dev/null 2>&1 &
 sleep 1
 
 echo "[*] Menjalankan Server Utama UI & Gateway V2Ray di Port Publik ${UI_PORT}..."
-PORT=${UI_PORT} MUX_PORT=${MUX_PORT} exec node server.js
+PORT=${UI_PORT} UI_PORT=${UI_PORT} MUX_PORT=${MUX_PORT} UDPGW_PORT=${UDPGW_PORT} exec node server.js
